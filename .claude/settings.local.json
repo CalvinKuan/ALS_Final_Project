@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"/c/Users/管奕凱/AppData/Local/Microsoft/WindowsApps/python3\" -c \"import ast; data=open\\('/c/Users/管奕凱/Desktop/ALS_Final_Project/student/optimizer.py'\\).read\\(\\); ast.parse\\(data\\); print\\('Syntax OK'\\)\")",
+      "PowerShell(& \"C:\\\\Users\\\\�ޫ���\\\\.cache\\\\codex-runtimes\\\\codex-primary-runtime\\\\dependencies\\\\python\\\\python.exe\" -c \"import ast; ast.parse\\(open\\(r'C:\\\\Users\\\\�ޫ���\\\\Desktop\\\\ALS_Final_Project\\\\student\\\\optimizer.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\" 2>&1)",
+      "PowerShell(& \"C:\\\\Users\\\\�ޫ���\\\\.cache\\\\codex-runtimes\\\\codex-primary-runtime\\\\dependencies\\\\python\\\\python.exe\" -c \"import ast; data=open\\(r'C:\\\\Users\\\\�ޫ���\\\\Desktop\\\\ALS_Final_Project\\\\student\\\\optimizer.py', encoding='utf-8'\\).read\\(\\); ast.parse\\(data\\); print\\('Syntax OK'\\)\" 2>&1)",
+      "Bash(python3 -c *)",
+      "PowerShell(Get-Command python3 -ErrorAction SilentlyContinue)",
+      "PowerShell(Get-Command python -ErrorAction SilentlyContinue)",
+      "PowerShell(Get-Command py -ErrorAction SilentlyContinue)",
+      "PowerShell(wsl python3 /mnt/c/Users/�ޫ���/Desktop/ALS_Final_Project/evaluate.py 2>&1)",
+      "PowerShell(wsl bash -c \"wc -l /mnt/c/Users/�ޫ���/Desktop/ALS_Final_Project/benchmarks/ex299.truth; head -1 /mnt/c/Users/�ޫ���/Desktop/ALS_Final_Project/benchmarks/ex299.truth | wc -c\")",
+      "PowerShell(wsl python3 /mnt/c/Users/�ޫ���/Desktop/ALS_Final_Project/check_flows.py)",
+      "WebFetch(domain:github.com)",
+      "PowerShell(wsl bash -c \"apt list --installed 2>/dev/null | grep -i python | head -10; which python3.10 python3.11 python3.12 2>/dev/null\")",
+      "PowerShell(wsl bash -c \"apt-cache show python3-pip 2>/dev/null | head -3; which pipx 2>/dev/null; ls /usr/lib/python3/ 2>/dev/null | head\")",
+      "PowerShell(wsl bash -c \"sudo apt-get install -y python3-pip 2>&1 | tail -5\")",
+      "Bash(gh api *)",
+      "PowerShell(wsl python3 /mnt/c/Users/�ޫ���/Desktop/ALS_Final_Project/test_new_synth.py)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\管奕凱\\.claude\\projects\\c--Users-----Desktop-ALS-Final-Project\\memory"
+    ]
+  }
+}
