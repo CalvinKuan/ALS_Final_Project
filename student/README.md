@@ -33,6 +33,33 @@ python student/optimizer.py \
 | `--no-abc` | — | 停用 ABC（純 Python 合成） |
 | `--no-mockturtle` | — | 停用 mockturtle 後處理 |
 
+## 多核心執行（推薦）
+
+預設會吃滿所有 CPU。建議指令：
+
+```bash
+# 全部 benchmark，用所有核心（預設）
+python student/optimizer.py
+
+# 限制 thread 數（同時跑多個 optimizer 時避免搶資源）
+python student/optimizer.py --max-workers 4
+
+# 並行跑多個 case，各自限 4 threads
+python student/optimizer.py --case ex215 --max-workers 4 &
+python student/optimizer.py --case ex217 --max-workers 4 &
+```
+
+> **查 CPU 核心數：**
+> ```powershell
+> # Windows PowerShell
+> (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors
+> ```
+> ```bash
+> # Linux / WSL
+> nproc
+> ```
+> 建議單人跑全部時不設 `--max-workers`（自動吃滿）；多人共機時每人設 `N/人數`。
+
 ## 效能調整
 
 ```bash
