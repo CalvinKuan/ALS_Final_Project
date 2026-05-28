@@ -15,14 +15,17 @@ Candidate sources:
 from __future__ import annotations
 
 import argparse
+import csv
 import functools
 import hashlib
+import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,9 +42,9 @@ for _value in range(65536):
     ODD16[_value] = _odd
 
 
-DEFAULT_ORDERS = ("natural", "reverse", "interleave", "byte_msb", "influence_desc")
+DEFAULT_ORDERS = ("natural", "reverse", "interleave", "interleave_rev", "byte_msb", "influence_desc", "influence_asc")
 QUICK_ORDERS = ("reverse", "byte_msb")
-DEFAULT_ANF_TERM_CAP = 768
+DEFAULT_ANF_TERM_CAP = 1024
 
 
 def popcount(value: int) -> int:
@@ -88,6 +91,53 @@ class Candidate:
         if self.path is None:
             raise ValueError("candidate has neither data nor path")
         return self.path.read_bytes()
+
+
+@dataclass(frozen=True)
+class ReverseVerilogMatch:
+    name: str
+    expression: str
+
+
+@dataclass(frozen=True)
+class OptimizerConfig:
+    abc: Path
+    yosys: Path
+    mockturtle: Path
+    output: Path
+    effort: str
+    orders: str | None
+    anf_phases: str | None
+    timeout: int
+    use_abc: bool
+    use_yosys: bool
+    use_mockturtle: bool
+    mockturtle_flows: tuple[str, ...]
+    mockturtle_top_k: int
+    mockturtle_rounds: int
+    portfolio_cycles: int
+    keep_existing: bool
+    verify_existing: bool
+    anf_term_cap: int
+    abc_aig_top_k: int
+    abc_aig_rounds: int
+    max_workers: int | None
+    pareto_dir: Path | None
+    dump_rev_verilog: Path | None
+    cec_final: bool
+
+
+@dataclass(frozen=True)
+class CaseRunResult:
+    case: str
+    candidate_name: str
+    inputs: int
+    stats: AigStats
+    old_stats: AigStats | None = None
+
+    @property
+    def improved(self) -> bool:
+        return self.old_stats is not None and self.stats.adp < self.old_stats.adp
 
 
 # -----------------------------------------------------------------------------
@@ -520,6 +570,442 @@ class AigBuilder:
 # -----------------------------------------------------------------------------
 # Candidate generators
 # -----------------------------------------------------------------------------
+
+class ReverseEngineerLibrary:
+    """Small structural recognizer for common 16-input arithmetic/bitwise blocks."""
+
+    def __init__(self, problem: TruthProblem) -> None:
+        self.problem = problem
+        self.builder = AigBuilder(problem.inputs, "optimizer.py reverse-engineered")
+        self.truth_mask = (1 << problem.rows) - 1
+        self.truth_to_lit: dict[int, int] = {0: 0, self.truth_mask: 1}
+        input_truths = input_truth_vectors(problem.inputs)
+        self.inputs_by_index: list[tuple[int, int]] = []
+        for idx in range(problem.inputs):
+            truth = input_truths[2 * (idx + 1)]
+            lit = 2 * (idx + 1)
+            self.inputs_by_index.append((truth, lit))
+            self.truth_to_lit.setdefault(truth, lit)
+            self.truth_to_lit.setdefault(self.truth_mask ^ truth, lit ^ 1)
+
+    def _remember(self, truth: int, lit: int) -> int:
+        self.truth_to_lit.setdefault(truth, lit)
+        return lit
+
+    def inv(self, item: tuple[int, int]) -> tuple[int, int]:
+        truth, lit = item
+        return self.truth_mask ^ truth, lit ^ 1
+
+    def and2(self, lhs: tuple[int, int], rhs: tuple[int, int]) -> tuple[int, int]:
+        truth = lhs[0] & rhs[0]
+        lit = self.builder.mk_and(lhs[1], rhs[1])
+        return truth, self._remember(truth, lit)
+
+    def or2(self, lhs: tuple[int, int], rhs: tuple[int, int]) -> tuple[int, int]:
+        truth = lhs[0] | rhs[0]
+        lit = self.builder.mk_or(lhs[1], rhs[1])
+        return truth, self._remember(truth, lit)
+
+    def xor2(self, lhs: tuple[int, int], rhs: tuple[int, int]) -> tuple[int, int]:
+        truth = lhs[0] ^ rhs[0]
+        lit = self.builder.mk_xor(lhs[1], rhs[1])
+        return truth, self._remember(truth, lit)
+
+    def input_bit(self, idx: int) -> tuple[int, int]:
+        return self.inputs_by_index[idx]
+
+    def const0(self) -> tuple[int, int]:
+        return 0, 0
+
+    def const1(self) -> tuple[int, int]:
+        return self.truth_mask, 1
+
+    def add_vector_signals(self, lhs: list[tuple[int, int]], rhs: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        carry = self.const0()
+        outputs: list[tuple[int, int]] = []
+        for a_bit, b_bit in zip(lhs, rhs):
+            axb = self.xor2(a_bit, b_bit)
+            sum_bit = self.xor2(axb, carry)
+            carry = self.or2(self.and2(a_bit, b_bit), self.and2(carry, axb))
+            self._remember(sum_bit[0], sum_bit[1])
+            self.truth_to_lit.setdefault(sum_bit[0], sum_bit[1])
+            outputs.append(sum_bit)
+        outputs.append(carry)
+        return outputs
+
+    def sub_vector_signals(self, lhs: list[tuple[int, int]], rhs: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        borrow = self.const0()
+        outputs: list[tuple[int, int]] = []
+        for a_bit, b_bit in zip(lhs, rhs):
+            axb = self.xor2(a_bit, b_bit)
+            diff = self.xor2(axb, borrow)
+            not_a = self.inv(a_bit)
+            not_axb = self.inv(axb)
+            borrow = self.or2(self.and2(not_a, b_bit), self.and2(not_axb, borrow))
+            outputs.append(diff)
+        outputs.append(borrow)
+        return outputs
+
+    def add_fixed_width(self, lhs: list[tuple[int, int]], rhs: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        carry = self.const0()
+        outputs: list[tuple[int, int]] = []
+        for a_bit, b_bit in zip(lhs, rhs):
+            axb = self.xor2(a_bit, b_bit)
+            outputs.append(self.xor2(axb, carry))
+            carry = self.or2(self.and2(a_bit, b_bit), self.and2(carry, axb))
+        return outputs
+
+    def covered_literals(self, outputs: list[int]) -> list[int] | None:
+        literals: list[int] = []
+        for truth in outputs:
+            lit = self.truth_to_lit.get(truth)
+            if lit is None:
+                return None
+            literals.append(lit)
+        return literals
+
+    def byte_inputs(self) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+        return [self.input_bit(i) for i in range(8)], [self.input_bit(i) for i in range(8, 16)]
+
+    def build_bitwise(self) -> None:
+        lo, hi = self.byte_inputs()
+        for lhs, rhs in ((lo, hi), (hi, lo)):
+            for op in (self.and2, self.or2, self.xor2):
+                bits = [op(a_bit, b_bit) for a_bit, b_bit in zip(lhs, rhs)]
+                for bit in bits:
+                    self._remember(bit[0], bit[1])
+                    self._remember(self.inv(bit)[0], self.inv(bit)[1])
+
+    def build_add_sub(self) -> None:
+        lo, hi = self.byte_inputs()
+        zero = self.const0()
+        for lhs, rhs in ((lo, hi), (hi, lo)):
+            add_bits = self.add_vector_signals(lhs, rhs)
+            sub_bits = self.sub_vector_signals(lhs, rhs)
+            for bit in add_bits + sub_bits:
+                self._remember(bit[0], bit[1])
+            for _ in range(16 - len(add_bits)):
+                add_bits.append(zero)
+            for _ in range(16 - len(sub_bits)):
+                sub_bits.append(zero)
+
+    def build_product(self) -> None:
+        lo, hi = self.byte_inputs()
+        zero = self.const0()
+        product = [zero for _ in range(16)]
+        for j, b_bit in enumerate(hi):
+            partial = [zero for _ in range(16)]
+            for i, a_bit in enumerate(lo):
+                partial[i + j] = self.and2(a_bit, b_bit)
+            product = self.add_fixed_width(product, partial)
+        for bit in product:
+            self._remember(bit[0], bit[1])
+
+    def build_eq(self) -> None:
+        lo, hi = self.byte_inputs()
+        eq_bits = [self.inv(self.xor2(a_bit, b_bit)) for a_bit, b_bit in zip(lo, hi)]
+        eq = self.builder.mk_balanced_and([lit for _truth, lit in eq_bits])
+        eq_truth = self.truth_mask
+        for truth, _lit in eq_bits:
+            eq_truth &= truth
+        self._remember(eq_truth, eq)
+
+    def build_compare(self) -> None:
+        lo, hi = self.byte_inputs()
+        for lhs, rhs in ((lo, hi), (hi, lo)):
+            equal_prefix = self.const1()
+            less_terms: list[tuple[int, int]] = []
+            greater_terms: list[tuple[int, int]] = []
+            for a_bit, b_bit in zip(reversed(lhs), reversed(rhs)):
+                less_terms.append(self.and2(equal_prefix, self.and2(self.inv(a_bit), b_bit)))
+                greater_terms.append(self.and2(equal_prefix, self.and2(a_bit, self.inv(b_bit))))
+                equal_prefix = self.and2(equal_prefix, self.inv(self.xor2(a_bit, b_bit)))
+            less = less_terms[0]
+            greater = greater_terms[0]
+            for term in less_terms[1:]:
+                less = self.or2(less, term)
+            for term in greater_terms[1:]:
+                greater = self.or2(greater, term)
+            self._remember(less[0], less[1])
+            self._remember(greater[0], greater[1])
+
+
+def synthesize_reverse_engineered_candidate(problem: TruthProblem) -> Candidate | None:
+    """Guess common circuit structure from the truth table and emit a shared AIG."""
+    if problem.inputs != 16 or len(problem.outputs) != 16:
+        return None
+    attempts = (
+        (),
+        ("bitwise",),
+        ("addsub",),
+        ("product",),
+        ("eq",),
+        ("compare",),
+    )
+    best: Candidate | None = None
+    for stages in attempts:
+        library = ReverseEngineerLibrary(problem)
+        for stage in stages:
+            if stage == "bitwise":
+                library.build_bitwise()
+            elif stage == "addsub":
+                library.build_add_sub()
+            elif stage == "product":
+                library.build_product()
+            elif stage == "eq":
+                library.build_eq()
+            elif stage == "compare":
+                library.build_compare()
+        outputs = library.covered_literals(problem.outputs)
+        if outputs is None:
+            continue
+        stats = library.builder.stats_for_outputs(outputs)
+        data = library.builder.to_binary_aig(outputs)
+        candidate = Candidate(name=f"reverse:{'+'.join(stages) or 'wires'}", stats=stats, data=data)
+        if better(candidate, best):
+            best = candidate
+    return best
+
+
+@functools.lru_cache(maxsize=None)
+def reverse_operation_outputs(name: str) -> tuple[int, ...]:
+    outputs = [0] * 16
+    for row in range(1 << 16):
+        a = row & 0xFF
+        b = (row >> 8) & 0xFF
+        if name == "add":
+            value = a + b
+        elif name == "sub_ab":
+            value = (a - b) & 0x1FF
+        elif name == "sub_ba":
+            value = (b - a) & 0x1FF
+        elif name == "mul":
+            value = a * b
+        else:
+            raise ValueError(f"unknown reverse operation: {name}")
+        for bit in range(16):
+            if (value >> bit) & 1:
+                outputs[bit] |= 1 << row
+    return tuple(outputs)
+
+
+def detect_reverse_verilog_match(problem: TruthProblem) -> ReverseVerilogMatch | None:
+    if problem.inputs != 16 or len(problem.outputs) != 16:
+        return None
+    actual = tuple(problem.outputs)
+    operation_exprs = {
+        "add": "{1'b0, a} + {1'b0, b}",
+        "sub_ab": "{1'b0, a} - {1'b0, b}",
+        "sub_ba": "{1'b0, b} - {1'b0, a}",
+        "mul": "{8'b0, a} * {8'b0, b}",
+    }
+    for name, expression in operation_exprs.items():
+        if actual == reverse_operation_outputs(name):
+            return ReverseVerilogMatch(name=name, expression=expression)
+    return None
+
+
+def reverse_verilog_text(match: ReverseVerilogMatch) -> str:
+    inputs = [f"i{i}" for i in range(16)]
+    outputs = [f"o{i}" for i in range(16)]
+    ports = ", ".join(inputs + outputs)
+    input_decl = ", ".join(inputs)
+    output_decl = ", ".join(outputs)
+    assign_outputs = "\n".join(f"  assign o{i} = y[{i}];" for i in range(16))
+    if match.name == "mul":
+        body = f"  assign y = {match.expression};"
+    else:
+        body = (
+            f"  wire [8:0] rev_result = {match.expression};\n"
+            "  assign y = {7'b0, rev_result};"
+        )
+    return (
+        "// Reverse-engineered Verilog generated by optimizer.py\n"
+        f"// Recognized operation: {match.name}\n"
+        f"module top({ports});\n"
+        f"  input {input_decl};\n"
+        f"  output {output_decl};\n"
+        "  wire [7:0] a = {i7, i6, i5, i4, i3, i2, i1, i0};\n"
+        "  wire [7:0] b = {i15, i14, i13, i12, i11, i10, i9, i8};\n"
+        "  wire [15:0] y;\n"
+        f"{body}\n"
+        f"{assign_outputs}\n"
+        "endmodule\n"
+    )
+
+
+def tool_path_arg(path: Path) -> str:
+    return '"' + command_path(path).replace('"', '\\"') + '"'
+
+
+def run_reverse_verilog_candidate(
+    yosys: Path,
+    abc: Path,
+    problem: TruthProblem,
+    case_name: str,
+    tmp_root: Path,
+    dump_dir: Path | None,
+    timeout: int,
+    run_yosys: bool,
+) -> Candidate | None:
+    match = detect_reverse_verilog_match(problem)
+    if match is None:
+        return None
+
+    verilog = reverse_verilog_text(match)
+    safe_name = safe_candidate_name(match.name)
+    if dump_dir is not None:
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        (dump_dir / f"{case_name}_{safe_name}.v").write_text(verilog, encoding="ascii")
+
+    if not run_yosys:
+        return None
+
+    verilog_path = tmp_root / f"{case_name}_{safe_name}_rev.v"
+    blif_path = tmp_root / f"{case_name}_{safe_name}_rev.blif"
+    aig_path = tmp_root / f"{case_name}_{safe_name}_rev.aig"
+    verilog_path.write_text(verilog, encoding="ascii")
+
+    yosys_command = (
+        f"read_verilog {tool_path_arg(verilog_path)}; "
+        "hierarchy -top top; proc; opt; flatten; opt; techmap; opt; "
+        f"write_blif {tool_path_arg(blif_path)}"
+    )
+    try:
+        yosys_result = subprocess.run(
+            [str(yosys), "-q", "-p", yosys_command],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if yosys_result.returncode != 0 or not blif_path.is_file():
+        return None
+
+    abc_command = (
+        f"read_blif {command_path(blif_path)}; "
+        "strash; dc2; "
+        f"write_aiger -s {command_path(aig_path)}"
+    )
+    try:
+        abc_result = subprocess.run(
+            [str(abc), "-c", abc_command],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if abc_result.returncode != 0 or not aig_path.is_file():
+        return None
+
+    try:
+        data = aig_path.read_bytes()
+        stats = aig_stats(data)
+    except (ValueError, IndexError):
+        return None
+    return Candidate(name=f"revv:{match.name}", stats=stats, data=data)
+
+
+def synthesize_byte_lut_candidate(
+    problem: TruthProblem,
+    ctrl_vars: list[int],
+    data_vars: list[int],
+    name: str,
+    max_unique: int = 160,
+    max_terms: int = 1400,
+) -> Candidate | None:
+    """Decompose f(ctrl,data) into ctrl decoding plus shared 8-bit data LUTs."""
+    if problem.inputs != 16 or len(ctrl_vars) != 8 or len(data_vars) != 8:
+        return None
+
+    sub_tables_by_output: list[list[int]] = []
+    unique_subtables: set[int] = set()
+    active_terms = 0
+    for truth in problem.outputs:
+        output_tables: list[int] = []
+        for ctrl in range(256):
+            sub_truth = 0
+            for data in range(256):
+                row = 0
+                for bit_idx, var in enumerate(data_vars):
+                    if (data >> bit_idx) & 1:
+                        row |= 1 << var
+                for bit_idx, var in enumerate(ctrl_vars):
+                    if (ctrl >> bit_idx) & 1:
+                        row |= 1 << var
+                if (truth >> row) & 1:
+                    sub_truth |= 1 << data
+            output_tables.append(sub_truth)
+            unique_subtables.add(sub_truth)
+            if sub_truth != 0:
+                active_terms += 1
+            if len(unique_subtables) > max_unique or active_terms > max_terms:
+                return None
+        sub_tables_by_output.append(output_tables)
+
+    builder = AigBuilder(problem.inputs, f"optimizer.py byte_lut {name}")
+    sub_memo: dict[tuple[int, int], int] = {}
+
+    def synth_sub(level: int, remaining: int, truth: int) -> int:
+        if truth == 0:
+            return 0
+        if truth == (1 << (1 << remaining)) - 1:
+            return 1
+        key = (level, truth)
+        cached = sub_memo.get(key)
+        if cached is not None:
+            return cached
+        low_truth, high_truth = split_low_high(truth, remaining)
+        condition = 2 * (data_vars[level] + 1)
+        lit = builder.mk_ite(
+            condition,
+            synth_sub(level + 1, remaining - 1, high_truth),
+            synth_sub(level + 1, remaining - 1, low_truth),
+        )
+        sub_memo[key] = lit
+        return lit
+
+    ctrl_decode: list[int] = []
+    for ctrl in range(256):
+        cube = [
+            2 * (var + 1) if (ctrl >> bit_idx) & 1 else 2 * (var + 1) + 1
+            for bit_idx, var in enumerate(ctrl_vars)
+        ]
+        ctrl_decode.append(builder.mk_balanced_and(cube))
+
+    def balanced_or(literals: list[int]) -> int:
+        if not literals:
+            return 0
+        layer = literals[:]
+        while len(layer) > 1:
+            nxt: list[int] = []
+            it = iter(layer)
+            for lhs in it:
+                rhs = next(it, None)
+                nxt.append(lhs if rhs is None else builder.mk_or(lhs, rhs))
+            layer = nxt
+        return layer[0]
+
+    outputs: list[int] = []
+    for output_tables in sub_tables_by_output:
+        terms: list[int] = []
+        for ctrl, sub_truth in enumerate(output_tables):
+            sub_lit = synth_sub(0, 8, sub_truth)
+            if sub_lit == 0:
+                continue
+            if sub_lit == 1:
+                terms.append(ctrl_decode[ctrl])
+            else:
+                terms.append(builder.mk_and(ctrl_decode[ctrl], sub_lit))
+        outputs.append(balanced_or(terms))
+
+    data = builder.to_binary_aig(outputs)
+    return Candidate(name=f"byte_lut:{name}", stats=builder.stats_for_outputs(outputs), data=data)
+
 
 def synthesize_bdd_candidate(problem: TruthProblem, order_name: str, order: list[int]) -> Candidate:
     manager = BddManager(order)
@@ -1009,6 +1495,62 @@ ABC_FLOWS = {
         "rewrite; rewrite -z; balance; refactor; refactor -z; "
         "resub; resub -K 6; resub -K 8; balance"
     ),
+    # ---- ABC9 synthesis flows (&syn2/&syn3/&syn4 explore different AIG structure space) ----
+    # &syn2: XOR-rich AIG rewriting (effective for arithmetic/FP circuits)
+    "abc:abc9_syn2": (
+        "st; strash; &get; &syn2; &put; balance; rewrite -z; refactor -z; balance"
+    ),
+    # &syn3: 3-input decomposition synthesis
+    "abc:abc9_syn3": (
+        "st; strash; &get; &syn3; &put; balance; rewrite -z; refactor -z; balance"
+    ),
+    # &syn4: 4-variable window synthesis
+    "abc:abc9_syn4": (
+        "st; strash; &get; &syn4; &put; balance; rewrite -z; refactor -z; balance"
+    ),
+    # combined syn2 + dc2 + syn3 sweep
+    "abc:abc9_combo": (
+        "st; strash; &get; &syn2; &dc2; &syn3; &put; balance; rewrite -z; refactor -z; balance"
+    ),
+    # full ABC9 synthesis pipeline
+    "abc:abc9_full": (
+        "st; strash; &get; &syn2; &dc2; &syn3; &dc2; &syn4; &put; "
+        "balance; rewrite -z; refactor -z; balance"
+    ),
+    # abc9 + classic compress2rs finish
+    "abc:abc9_crs": (
+        "st; strash; &get; &syn2; &dc2; &syn3; &put; "
+        "balance; rewrite; rewrite -z; balance; refactor; refactor -z; "
+        "resub; resub -K 6; resub -K 8; balance"
+    ),
+    # very aggressive: lcorr + triple dc2 + high-K resub (for large multi-output circuits)
+    "abc:deep_area": (
+        "st; strash; lcorr; dc2; dc2; dc2; balance; rewrite; refactor; "
+        "rewrite -z; refactor -z; resub -K 10; resub -K 12; balance; dc2; balance"
+    ),
+    # area-biased flows: deliberately use less balancing so ABC may keep a
+    # smaller, deeper network when that wins ADP.
+    "abc:area_dc2": (
+        "st; strash; dc2; dc2; dc2; rewrite -z; refactor -z; dc2"
+    ),
+    "abc:area_dch": (
+        "st; strash; dch; dc2; dch; dc2; rewrite -z; refactor -z; dc2"
+    ),
+    "abc:area_fraig": (
+        "st; strash; fraig; dc2; dch; dc2; rewrite -z; refactor -z; dc2"
+    ),
+    "abc:area_resub": (
+        "st; strash; rewrite -z; refactor -z; resub -K 10; resub -K 12; "
+        "resub -K 12 -N 2; dc2; dch; dc2"
+    ),
+    "abc:area_aig": (
+        "st; strash; &get; &dc2; &dc2; &dc2; &put; dc2; dch; dc2"
+    ),
+    # lcorr + abc9_combo (best of both worlds for large circuits)
+    "abc:lcorr_abc9": (
+        "st; strash; lcorr; &get; &syn2; &dc2; &syn3; &put; "
+        "balance; rewrite -z; refactor -z; resub -K 8; balance"
+    ),
 }
 
 # ABC optimisation flows that start from an existing AIG file rather than a truth table.
@@ -1080,28 +1622,78 @@ AIG_FLOWS = {
     "aig:lcorr_dc2": (
         "strash; lcorr; dc2; balance; rewrite -z; refactor -z; balance"
     ),
+    # ---- ABC9 AIG-refinement flows ----
+    "aig:abc9_syn2": (
+        "strash; &get; &syn2; &put; balance; rewrite -z; refactor -z; balance"
+    ),
+    "aig:abc9_syn3": (
+        "strash; &get; &syn3; &put; balance; rewrite -z; refactor -z; balance"
+    ),
+    "aig:abc9_syn4": (
+        "strash; &get; &syn4; &put; balance; rewrite -z; refactor -z; balance"
+    ),
+    "aig:abc9_combo": (
+        "strash; &get; &syn2; &dc2; &syn3; &put; balance; rewrite -z; refactor -z; balance"
+    ),
+    "aig:abc9_full": (
+        "strash; &get; &syn2; &dc2; &syn3; &dc2; &syn4; &put; "
+        "balance; rewrite -z; refactor -z; balance"
+    ),
+    "aig:abc9_crs": (
+        "strash; &get; &syn2; &dc2; &syn3; &put; "
+        "balance; rewrite; rewrite -z; balance; refactor; refactor -z; "
+        "resub; resub -K 6; resub -K 8; balance"
+    ),
+    # very aggressive area flow for large AIGs
+    "aig:deep_area": (
+        "strash; lcorr; dc2; dc2; dc2; balance; rewrite; refactor; "
+        "rewrite -z; refactor -z; resub -K 10; resub -K 12; balance; dc2; balance"
+    ),
+    # area-biased refinements.  These intentionally avoid a final balance pass.
+    "aig:area_dc2": "strash; dc2; dc2; dc2; rewrite -z; refactor -z; dc2",
+    "aig:area_dch": "strash; dch; dc2; dch; dc2; rewrite -z; refactor -z; dc2",
+    "aig:area_fraig": "strash; fraig; dc2; dch; dc2; rewrite -z; refactor -z; dc2",
+    "aig:area_resub": (
+        "strash; rewrite -z; refactor -z; resub -K 10; resub -K 12; "
+        "resub -K 12 -N 2; dc2; dch; dc2"
+    ),
+    "aig:area_aig": "strash; &get; &dc2; &dc2; &dc2; &put; dc2; dch; dc2",
+    # lcorr + abc9 on existing AIG
+    "aig:lcorr_abc9": (
+        "strash; lcorr; &get; &syn2; &dc2; &syn3; &put; "
+        "balance; rewrite -z; refactor -z; resub -K 8; balance"
+    ),
 }
 
 # Effort-based subsets — quick runs far fewer flows but still gets diverse results.
 _ABC_QUICK = [
     "abc:rw", "abc:dc2", "abc:rs", "abc:aig",
     "abc:compress2rs", "abc:dch",
+    "abc:area_dc2", "abc:area_dch", "abc:area_aig",
 ]
 _ABC_MEDIUM = [
     "abc:baseline", "abc:rw", "abc:rwz", "abc:dc2", "abc:dc2x",
     "abc:rs", "abc:rs2", "abc:aig", "abc:aig2", "abc:compress2",
     "abc:compress2rs", "abc:compress2rs2", "abc:resyn2", "abc:fraig",
     "abc:dch", "abc:dch_dc2", "abc:rs_k10", "abc:lcorr",
+    "abc:abc9_syn2", "abc:abc9_syn3", "abc:abc9_combo", "abc:abc9_full",
+    "abc:deep_area", "abc:lcorr_abc9",
+    "abc:area_dc2", "abc:area_dch", "abc:area_fraig", "abc:area_resub", "abc:area_aig",
 ]
 # _ABC_HIGH uses all of ABC_FLOWS
 
 _AIG_QUICK = [
     "aig:rw", "aig:dc2", "aig:compress2rs", "aig:dch",
+    "aig:abc9_syn2",
+    "aig:area_dc2", "aig:area_dch", "aig:area_aig",
 ]
 _AIG_MEDIUM = [
     "aig:rw", "aig:dc2", "aig:resyn2", "aig:rs", "aig:dc2x",
     "aig:compress2rs", "aig:fraig_dc2", "aig:dch", "aig:dch_dc2",
     "aig:rs_k10", "aig:lcorr",
+    "aig:abc9_syn2", "aig:abc9_syn3", "aig:abc9_combo", "aig:abc9_full",
+    "aig:deep_area", "aig:lcorr_abc9",
+    "aig:area_dc2", "aig:area_dch", "aig:area_fraig", "aig:area_resub", "aig:area_aig",
 ]
 # _AIG_HIGH uses all of AIG_FLOWS
 
@@ -1125,12 +1717,31 @@ def run_abc_flow(abc: Path, truth: Path, output: Path, flow: str, timeout: int) 
     return result.returncode == 0 and output.is_file()
 
 
-def executable_available(executable: Path, timeout: int, args: list[str] | None = None) -> bool:
-    if not executable.is_file():
-        return False
+def is_equivalent_by_abc(abc: Path, truth: Path, aig: Path, timeout: int) -> tuple[bool, str]:
+    command = f"read_truth -xf {command_path(truth)}; st; &get; &cec -t {command_path(aig)}"
     try:
         result = subprocess.run(
-            [str(executable)] + (args or []),
+            [str(abc), "-c", command],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    return result.returncode == 0 and "Networks are equivalent" in result.stdout, result.stdout
+
+
+def executable_available(executable: Path, timeout: int, args: list[str] | None = None) -> bool:
+    command = str(executable)
+    if not executable.is_file():
+        resolved = shutil.which(command)
+        if resolved is None:
+            return False
+        command = resolved
+    try:
+        result = subprocess.run(
+            [command] + (args or []),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -1247,19 +1858,152 @@ def better(candidate: Candidate, incumbent: Candidate | None) -> bool:
     return left < right
 
 
+def pareto_front(candidates: list[Candidate]) -> list[Candidate]:
+    """Return the Pareto-optimal subset minimizing both area and delay."""
+    front: list[Candidate] = []
+    for cand in candidates:
+        dominated = False
+        new_front: list[Candidate] = []
+        for p in front:
+            if p.stats.area <= cand.stats.area and p.stats.delay <= cand.stats.delay:
+                dominated = True
+                new_front.append(p)
+            elif cand.stats.area <= p.stats.area and cand.stats.delay <= p.stats.delay:
+                pass  # cand dominates p, drop p
+            else:
+                new_front.append(p)
+        if not dominated:
+            new_front.append(cand)
+        front = new_front
+    return front
+
+
+def safe_candidate_name(name: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in name)
+
+
+def save_pareto_front(case_name: str, candidates: list[Candidate], pareto_dir: Path) -> None:
+    case_dir = pareto_dir / case_name
+    case_dir.mkdir(parents=True, exist_ok=True)
+    front = sorted(
+        pareto_front(candidates),
+        key=lambda candidate: (
+            candidate.stats.area,
+            candidate.stats.delay,
+            candidate.stats.adp,
+            candidate.name,
+        ),
+    )
+    manifest = []
+    for index, candidate in enumerate(front):
+        filename = (
+            f"{index:02d}_{safe_candidate_name(candidate.name)}_"
+            f"a{candidate.stats.area}_l{candidate.stats.delay}.aig"
+        )
+        (case_dir / filename).write_bytes(candidate.read_bytes())
+        manifest.append(
+            {
+                "file": filename,
+                "name": candidate.name,
+                "area": candidate.stats.area,
+                "delay": candidate.stats.delay,
+                "adp": candidate.stats.adp,
+            }
+        )
+    (case_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+
+def read_reference_csv(path: Path) -> dict[str, AigStats]:
+    refs: dict[str, AigStats] = {}
+    with path.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            case = row.get("case")
+            if not case:
+                continue
+            refs[case] = AigStats(area=int(row["area"]), delay=int(row["delay"]))
+    return refs
+
+
+def reference_gap_rows(
+    truth_files: list[Path],
+    output_dir: Path,
+    refs: dict[str, AigStats],
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for truth in truth_files:
+        case = truth.stem
+        ref = refs.get(case)
+        if ref is None:
+            continue
+        current: AigStats | None = None
+        aig_path = output_dir / f"{case}.aig"
+        if aig_path.is_file():
+            try:
+                current = aig_stats(aig_path.read_bytes())
+            except (ValueError, IndexError):
+                current = None
+        gap = None if current is None else current.adp / ref.adp
+        rows.append(
+            {
+                "case": case,
+                "current": current,
+                "reference": ref,
+                "gap": gap,
+                "delta": None if current is None else current.adp - ref.adp,
+            }
+        )
+    return rows
+
+
+def print_reference_gap_report(rows: list[dict[str, object]], top: int) -> None:
+    if not rows:
+        return
+    ranked = sorted(
+        rows,
+        key=lambda row: (
+            -1.0 if row["gap"] is None else -float(row["gap"]),
+            row["case"],
+        ),
+    )
+    print("[REF] worst current/reference ADP gaps:")
+    for row in ranked[:top]:
+        case = str(row["case"])
+        current = row["current"]
+        reference = row["reference"]
+        if not isinstance(reference, AigStats):
+            continue
+        if not isinstance(current, AigStats):
+            print(
+                f"[REF] {case}: missing/invalid output, "
+                f"ref_area={reference.area} ref_delay={reference.delay} ref_adp={reference.adp}"
+            )
+            continue
+        gap = float(row["gap"])
+        delta = int(row["delta"])
+        sign = "+" if delta >= 0 else ""
+        print(
+            f"[REF] {case}: gap={gap:.2f}x delta={sign}{delta} "
+            f"cur=({current.area},{current.delay},{current.adp}) "
+            f"ref=({reference.area},{reference.delay},{reference.adp})"
+        )
+
+
 def optimize_case(
     truth: Path,
     output: Path,
     abc: Path,
+    yosys: Path,
     mockturtle: Path,
     order_items: list[tuple[str, list[int]]],
     phase_items: list[tuple[str, int]],
     timeout: int,
     use_abc: bool,
+    use_yosys: bool,
     use_mockturtle: bool,
     mockturtle_flows: list[str],
     mockturtle_top_k: int,
     mockturtle_rounds: int,
+    portfolio_cycles: int,
     keep_existing: bool,
     verify_existing: bool,
     anf_term_cap: int,
@@ -1267,6 +2011,9 @@ def optimize_case(
     abc_aig_rounds: int = 1,
     max_workers: int | None = None,
     effort: str = "medium",
+    pareto_dir: Path | None = None,
+    dump_rev_verilog: Path | None = None,
+    cec_final: bool = False,
 ) -> Candidate:
     problem = read_truth_problem(truth)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -1296,6 +2043,22 @@ def optimize_case(
         add_candidate(existing_candidate(output, problem, verify_existing))
 
     # Fast pure-Python candidates first (no subprocess overhead)
+    add_candidate(synthesize_reverse_engineered_candidate(problem))
+    add_candidate(synthesize_byte_lut_candidate(problem, list(range(8, 16)), list(range(8)), "hi_ctrl"))
+    add_candidate(synthesize_byte_lut_candidate(problem, list(range(8)), list(range(8, 16)), "lo_ctrl"))
+    with tempfile.TemporaryDirectory(prefix=f"{truth.stem}_revv_", dir=output.parent) as tmp_dir:
+        add_candidate(
+            run_reverse_verilog_candidate(
+                yosys=yosys,
+                abc=abc,
+                problem=problem,
+                case_name=truth.stem,
+                tmp_root=Path(tmp_dir),
+                dump_dir=dump_rev_verilog,
+                timeout=timeout,
+                run_yosys=use_yosys and use_abc,
+            )
+        )
     add_candidate(synthesize_sparse_candidate(problem))
     add_candidate(synthesize_mux_candidate(problem))
 
@@ -1388,15 +2151,33 @@ def optimize_case(
     # ABC AIG refinement: run AIG-to-AIG ABC flows on the top-k candidates found so
     # far (including mockturtle results).  Different starting points lead ABC to
     # different local optima, often improving on the truth-table starting point.
+    # We use both ADP-ranked top-k AND the Pareto front (area vs delay) to maximise
+    # the diversity of starting points explored.
     if use_abc and candidates and abc_aig_rounds > 0:
         tried_aig: set[tuple[bytes, str]] = set()
         with tempfile.TemporaryDirectory(prefix=f"{truth.stem}_abc_aig_", dir=output.parent) as tmp_dir:
             tmp_root = Path(tmp_dir)
             for round_idx in range(abc_aig_rounds):
-                sources = sorted(
+                adp_sorted = sorted(
                     candidates,
                     key=lambda c: (c.stats.adp, c.stats.area, c.stats.delay, c.name),
                 )[:abc_aig_top_k]
+                area_sorted = sorted(
+                    candidates,
+                    key=lambda c: (c.stats.area, c.stats.delay, c.stats.adp, c.name),
+                )[:abc_aig_top_k]
+                delay_sorted = sorted(
+                    candidates,
+                    key=lambda c: (c.stats.delay, c.stats.area, c.stats.adp, c.name),
+                )[:max(1, abc_aig_top_k // 2)]
+                pfront = pareto_front(candidates)
+                seen_ids: set[int] = set()
+                sources: list[Candidate] = []
+                for c in adp_sorted + area_sorted + delay_sorted + pfront:
+                    if id(c) not in seen_ids:
+                        seen_ids.add(id(c))
+                        sources.append(c)
+                sources = sources[: abc_aig_top_k * 3]
 
                 if effort == "quick":
                     selected_aig = {k: AIG_FLOWS[k] for k in _AIG_QUICK if k in AIG_FLOWS}
@@ -1439,11 +2220,200 @@ def optimize_case(
                 if added_this_round == 0:
                     break
 
+    for cycle_idx in range(max(0, portfolio_cycles - 1)):
+        if use_mockturtle and candidates:
+            tried_mockturtle: set[tuple[bytes, str]] = set()
+            with tempfile.TemporaryDirectory(prefix=f"{truth.stem}_xmt{cycle_idx}_", dir=output.parent) as tmp_dir:
+                tmp_root = Path(tmp_dir)
+                for round_idx in range(mockturtle_rounds):
+                    sources = sorted(
+                        pareto_front(candidates),
+                        key=lambda candidate: (
+                            candidate.stats.adp,
+                            candidate.stats.area,
+                            candidate.stats.delay,
+                            candidate.name,
+                        ),
+                    )[:mockturtle_top_k]
+                    if len(sources) < mockturtle_top_k:
+                        for source in sorted(
+                            candidates,
+                            key=lambda candidate: (
+                                candidate.stats.adp,
+                                candidate.stats.area,
+                                candidate.stats.delay,
+                                candidate.name,
+                            ),
+                        ):
+                            if source not in sources:
+                                sources.append(source)
+                            if len(sources) >= mockturtle_top_k:
+                                break
+
+                    mt_tasks: list[tuple[int, Candidate, str]] = []
+                    for source_index, source in enumerate(sources):
+                        source_digest = hashlib.sha256(source.read_bytes()).digest()
+                        for flow in mockturtle_flows:
+                            key = (source_digest, flow)
+                            if key not in tried_mockturtle:
+                                tried_mockturtle.add(key)
+                                mt_tasks.append((source_index, source, flow))
+
+                    if not mt_tasks:
+                        break
+
+                    def _run_cross_mt_task(task: tuple[int, Candidate, str]) -> Candidate | None:
+                        source_index, source, flow = task
+                        return run_mockturtle_flow(
+                            mockturtle=mockturtle,
+                            source=source,
+                            tmp_root=tmp_root,
+                            case_name=f"{truth.stem}_x{cycle_idx}_{round_idx}_{source_index}",
+                            flow=flow,
+                            timeout=timeout,
+                        )
+
+                    workers = min(len(mt_tasks), max_workers or os.cpu_count() or 4)
+                    added_this_round = 0
+                    with ThreadPoolExecutor(max_workers=workers) as pool:
+                        for cand in pool.map(_run_cross_mt_task, mt_tasks):
+                            if add_candidate(cand):
+                                added_this_round += 1
+
+                    if added_this_round == 0:
+                        break
+
+        if use_abc and candidates and abc_aig_rounds > 0:
+            tried_aig: set[tuple[bytes, str]] = set()
+            with tempfile.TemporaryDirectory(prefix=f"{truth.stem}_xabc{cycle_idx}_", dir=output.parent) as tmp_dir:
+                tmp_root = Path(tmp_dir)
+                for round_idx in range(abc_aig_rounds):
+                    pfront = pareto_front(candidates)
+                    sources = sorted(
+                        pfront,
+                        key=lambda c: (c.stats.adp, c.stats.area, c.stats.delay, c.name),
+                    )[:abc_aig_top_k * 2]
+                    area_sources = sorted(
+                        candidates,
+                        key=lambda c: (c.stats.area, c.stats.delay, c.stats.adp, c.name),
+                    )[:abc_aig_top_k]
+                    for c in area_sources:
+                        if c not in sources:
+                            sources.append(c)
+                    sources = sources[: abc_aig_top_k * 3]
+
+                    if effort == "quick":
+                        selected_aig = {k: AIG_FLOWS[k] for k in _AIG_QUICK if k in AIG_FLOWS}
+                    elif effort == "high":
+                        selected_aig = AIG_FLOWS
+                    else:
+                        selected_aig = {k: AIG_FLOWS[k] for k in _AIG_MEDIUM if k in AIG_FLOWS}
+
+                    aig_tasks: list[tuple[int, Candidate, str, str]] = []
+                    for src_idx, source in enumerate(sources):
+                        src_digest = hashlib.sha256(source.read_bytes()).digest()
+                        for flow_name, flow in selected_aig.items():
+                            key = (src_digest, flow_name)
+                            if key not in tried_aig:
+                                tried_aig.add(key)
+                                aig_tasks.append((src_idx, source, flow_name, flow))
+
+                    if not aig_tasks:
+                        break
+
+                    def _run_cross_aig_task(task: tuple[int, Candidate, str, str]) -> Candidate | None:
+                        src_idx, source, flow_name, flow = task
+                        return run_abc_aig_candidate(
+                            abc=abc,
+                            source=source,
+                            tmp_root=tmp_root,
+                            case_name=f"{truth.stem}_x{cycle_idx}_{round_idx}_{src_idx}",
+                            flow_name=flow_name,
+                            flow=flow,
+                            timeout=timeout,
+                        )
+
+                    workers = min(len(aig_tasks), max_workers or os.cpu_count() or 4)
+                    added_this_round = 0
+                    with ThreadPoolExecutor(max_workers=workers) as pool:
+                        for cand in pool.map(_run_cross_aig_task, aig_tasks):
+                            if add_candidate(cand):
+                                added_this_round += 1
+
+                    if added_this_round == 0:
+                        break
+
     if best is None:
         raise RuntimeError(f"no valid candidate produced for {truth.name}")
 
+    if pareto_dir is not None:
+        save_pareto_front(truth.stem, candidates, pareto_dir)
+
     output.write_bytes(best.read_bytes())
+    if cec_final:
+        if not use_abc:
+            raise RuntimeError("--cec-final requested but ABC is unavailable")
+        equivalent, message = is_equivalent_by_abc(abc, truth, output, timeout)
+        if not equivalent:
+            tail = message.strip().splitlines()[-1] if message.strip() else "no ABC output"
+            raise RuntimeError(f"ABC CEC failed for {truth.name}: {tail}")
     return best
+
+
+def run_one_case(truth: Path, config: OptimizerConfig) -> CaseRunResult:
+    if not truth.is_file():
+        raise FileNotFoundError(f"Missing benchmark: {truth}")
+
+    problem = read_truth_problem(truth)
+    order_items = choose_orders(problem, config.effort, config.orders)
+    phase_items = make_phase_library(problem, config.effort, config.anf_phases)
+
+    output = config.output / f"{truth.stem}.aig"
+    old_stats = None
+    if output.is_file():
+        try:
+            output_data = output.read_bytes()
+            parsed_inputs, _outputs, _ands = parse_binary_aig(output_data)
+            if parsed_inputs == problem.inputs:
+                old_stats = aig_stats(output_data)
+        except (ValueError, IndexError):
+            old_stats = None
+
+    candidate = optimize_case(
+        truth=truth,
+        output=output,
+        abc=config.abc,
+        yosys=config.yosys,
+        mockturtle=config.mockturtle,
+        order_items=order_items,
+        phase_items=phase_items,
+        timeout=config.timeout,
+        use_abc=config.use_abc,
+        use_yosys=config.use_yosys,
+        use_mockturtle=config.use_mockturtle,
+        mockturtle_flows=list(config.mockturtle_flows),
+        mockturtle_top_k=config.mockturtle_top_k,
+        mockturtle_rounds=config.mockturtle_rounds,
+        portfolio_cycles=config.portfolio_cycles,
+        keep_existing=config.keep_existing,
+        verify_existing=config.verify_existing,
+        anf_term_cap=config.anf_term_cap,
+        abc_aig_top_k=config.abc_aig_top_k,
+        abc_aig_rounds=config.abc_aig_rounds,
+        max_workers=config.max_workers,
+        effort=config.effort,
+        pareto_dir=config.pareto_dir,
+        dump_rev_verilog=config.dump_rev_verilog,
+        cec_final=config.cec_final,
+    )
+
+    return CaseRunResult(
+        case=truth.stem,
+        candidate_name=candidate.name,
+        inputs=problem.inputs,
+        stats=candidate.stats,
+        old_stats=old_stats,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -1462,9 +2432,15 @@ def parse_args() -> argparse.Namespace:
         help="Path to the ABC executable.",
     )
     parser.add_argument(
+        "--yosys",
+        type=Path,
+        default=Path("yosys"),
+        help="Path to the Yosys executable, or 'yosys' to use PATH.",
+    )
+    parser.add_argument(
         "--mockturtle",
         type=Path,
-        default=repo_root / "mockturtle" / "build" / "examples" / "mockturtle_opt",
+        default=Path(__file__).resolve().with_name("mockturtle_opt"),
         help="Path to the mockturtle_opt executable.",
     )
     parser.add_argument(
@@ -1498,7 +2474,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--timeout",
         type=int,
-        default=30,
+        default=60,
         help="Timeout in seconds for each ABC or mockturtle flow.",
     )
     parser.add_argument(
@@ -1513,6 +2489,11 @@ def parse_args() -> argparse.Namespace:
         help="Disable ABC candidates.",
     )
     parser.add_argument(
+        "--no-yosys",
+        action="store_true",
+        help="Disable reverse-engineered Verilog synthesis through Yosys.",
+    )
+    parser.add_argument(
         "--no-mockturtle",
         action="store_true",
         help="Disable mockturtle post-optimization candidates.",
@@ -1525,14 +2506,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mockturtle-top-k",
         type=int,
-        default=3,
+        default=5,
         help="Run mockturtle on the best K pre-mockturtle candidates.",
     )
     parser.add_argument(
         "--mockturtle-rounds",
         type=int,
-        default=1,
+        default=3,
         help="Repeat mockturtle post-optimization for this many improvement rounds.",
+    )
+    parser.add_argument(
+        "--portfolio-cycles",
+        type=int,
+        default=1,
+        help="Repeat ABC/ABC9 and mockturtle cross-optimization cycles. "
+             "Use 2-3 for stubborn cases.",
     )
     parser.add_argument(
         "--ignore-existing",
@@ -1552,15 +2540,68 @@ def parse_args() -> argparse.Namespace:
              "Set lower (e.g. 2-4) when running multiple optimizer instances in parallel.",
     )
     parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="Number of benchmark cases to optimize in parallel. Use 0 for all CPU cores.",
+    )
+    parser.add_argument(
+        "--pareto-dir",
+        type=Path,
+        default=None,
+        help="Optional directory for saving each case's area-delay Pareto-front candidates.",
+    )
+    parser.add_argument(
+        "--reference-csv",
+        type=Path,
+        default=None,
+        help="Optional reference_result.csv for reporting and targeting losing cases.",
+    )
+    parser.add_argument(
+        "--reference-top",
+        type=int,
+        default=20,
+        help="How many worst reference gaps to print when --reference-csv is set.",
+    )
+    parser.add_argument(
+        "--only-reference-lagging",
+        action="store_true",
+        help="With --reference-csv, optimize only cases whose current ADP is worse than reference.",
+    )
+    parser.add_argument(
+        "--reference-report-only",
+        action="store_true",
+        help="With --reference-csv, print the gap report and exit without optimizing.",
+    )
+    parser.add_argument(
+        "--reference-gap-threshold",
+        type=float,
+        default=1.0,
+        help="Current/reference ADP threshold for --only-reference-lagging.",
+    )
+    parser.add_argument(
+        "--dump-rev-verilog",
+        nargs="?",
+        default=None,
+        const="",
+        help="Dump recognized reverse-engineered Verilog. "
+             "With no path, writes under <output>/rev_verilog.",
+    )
+    parser.add_argument(
+        "--cec-final",
+        action="store_true",
+        help="Run ABC CEC on each final written AIG before reporting success.",
+    )
+    parser.add_argument(
         "--abc-aig-top-k",
         type=int,
-        default=3,
+        default=5,
         help="Run ABC AIG-refinement flows on the best K candidates after all other synthesis.",
     )
     parser.add_argument(
         "--abc-aig-rounds",
         type=int,
-        default=1,
+        default=2,
         help="Repeat ABC AIG-refinement for this many improvement rounds (0 to disable).",
     )
     return parser.parse_args()
@@ -1581,6 +2622,44 @@ def main() -> int:
         print("No benchmark truth files found.", file=sys.stderr)
         return 2
 
+    reference_stats: dict[str, AigStats] | None = None
+    if args.only_reference_lagging and args.reference_csv is None:
+        print("--only-reference-lagging requires --reference-csv", file=sys.stderr)
+        return 2
+    if args.reference_report_only and args.reference_csv is None:
+        print("--reference-report-only requires --reference-csv", file=sys.stderr)
+        return 2
+    if args.reference_csv is not None:
+        if not args.reference_csv.is_file():
+            print(f"Reference CSV not found: {args.reference_csv}", file=sys.stderr)
+            return 2
+        if args.reference_top < 1:
+            print("--reference-top must be at least 1.", file=sys.stderr)
+            return 2
+        if args.reference_gap_threshold < 0:
+            print("--reference-gap-threshold must be non-negative.", file=sys.stderr)
+            return 2
+        reference_stats = read_reference_csv(args.reference_csv)
+        gap_rows = reference_gap_rows(truth_files, args.output, reference_stats)
+        print_reference_gap_report(gap_rows, args.reference_top)
+        if args.reference_report_only:
+            return 0
+        if args.only_reference_lagging:
+            row_by_case = {str(row["case"]): row for row in gap_rows}
+            filtered: list[Path] = []
+            for truth in truth_files:
+                row = row_by_case.get(truth.stem)
+                if row is None:
+                    continue
+                gap = row["gap"]
+                if gap is None or float(gap) > args.reference_gap_threshold:
+                    filtered.append(truth)
+            truth_files = filtered
+            print(f"[REF] optimizing {len(truth_files)} lagging case(s)")
+            if not truth_files:
+                print("No lagging cases selected.")
+                return 0
+
     mockturtle_flows = [flow.strip() for flow in args.mockturtle_flows.split(",") if flow.strip()]
     if not mockturtle_flows:
         print("--mockturtle-flows must contain at least one flow name.", file=sys.stderr)
@@ -1591,6 +2670,9 @@ def main() -> int:
     if args.mockturtle_rounds < 1:
         print("--mockturtle-rounds must be at least 1.", file=sys.stderr)
         return 2
+    if args.portfolio_cycles < 1:
+        print("--portfolio-cycles must be at least 1.", file=sys.stderr)
+        return 2
 
     use_abc = False
     if not args.no_abc:
@@ -1600,6 +2682,14 @@ def main() -> int:
     else:
         print("[INFO] ABC disabled by --no-abc")
 
+    use_yosys = False
+    if not args.no_yosys:
+        use_yosys = executable_available(args.yosys, min(args.timeout, 10), ["-V"])
+        if not use_yosys:
+            print(f"[WARN] Yosys is unavailable, skipping reverse-Verilog synthesis: {args.yosys}")
+    else:
+        print("[INFO] Yosys reverse-Verilog synthesis disabled by --no-yosys")
+
     use_mockturtle = False
     if not args.no_mockturtle:
         use_mockturtle = executable_available(args.mockturtle, min(args.timeout, 10))
@@ -1608,67 +2698,100 @@ def main() -> int:
     else:
         print("[INFO] mockturtle disabled by --no-mockturtle")
 
-    total_adp = 0
-    improved = 0
+    if args.max_workers is not None and args.max_workers < 1:
+        print("--max-workers must be at least 1.", file=sys.stderr)
+        return 2
+    if args.jobs < 0:
+        print("--jobs must be at least 0.", file=sys.stderr)
+        return 2
 
-    for truth in truth_files:
-        if not truth.is_file():
-            print(f"Missing benchmark: {truth}", file=sys.stderr)
-            return 2
+    cpu_count = os.cpu_count() or 1
+    jobs = cpu_count if args.jobs == 0 else args.jobs
+    jobs = max(1, min(jobs, len(truth_files)))
+    per_case_workers = args.max_workers
+    if per_case_workers is None:
+        per_case_workers = max(1, cpu_count // jobs)
 
-        try:
-            problem = read_truth_problem(truth)
-            order_items = choose_orders(problem, args.effort, args.orders)
-            phase_items = make_phase_library(problem, args.effort, args.anf_phases)
-        except ValueError as exc:
-            print(f"{truth.name}: {exc}", file=sys.stderr)
-            return 2
+    dump_rev_verilog = None
+    if args.dump_rev_verilog is not None:
+        dump_rev_verilog = args.output / "rev_verilog" if args.dump_rev_verilog == "" else Path(args.dump_rev_verilog)
 
-        output = args.output / f"{truth.stem}.aig"
-        old_stats = None
-        if output.is_file():
-            try:
-                parsed_inputs, _outputs, _ands = parse_binary_aig(output.read_bytes())
-                if parsed_inputs == problem.inputs:
-                    old_stats = aig_stats(output.read_bytes())
-            except (ValueError, IndexError):
-                old_stats = None
+    config = OptimizerConfig(
+        abc=args.abc,
+        yosys=args.yosys,
+        mockturtle=args.mockturtle,
+        output=args.output,
+        effort=args.effort,
+        orders=args.orders,
+        anf_phases=args.anf_phases,
+        timeout=args.timeout,
+        use_abc=use_abc,
+        use_yosys=use_yosys,
+        use_mockturtle=use_mockturtle,
+        mockturtle_flows=tuple(mockturtle_flows),
+        mockturtle_top_k=args.mockturtle_top_k,
+        mockturtle_rounds=args.mockturtle_rounds,
+        portfolio_cycles=args.portfolio_cycles,
+        keep_existing=not args.ignore_existing,
+        verify_existing=args.verify_existing,
+        anf_term_cap=args.anf_term_cap,
+        abc_aig_top_k=args.abc_aig_top_k,
+        abc_aig_rounds=args.abc_aig_rounds,
+        max_workers=per_case_workers,
+        pareto_dir=args.pareto_dir,
+        dump_rev_verilog=dump_rev_verilog,
+        cec_final=args.cec_final,
+    )
 
-        candidate = optimize_case(
-            truth=truth,
-            output=output,
-            abc=args.abc,
-            mockturtle=args.mockturtle,
-            order_items=order_items,
-            phase_items=phase_items,
-            timeout=args.timeout,
-            use_abc=use_abc,
-            use_mockturtle=use_mockturtle,
-            mockturtle_flows=mockturtle_flows,
-            mockturtle_top_k=args.mockturtle_top_k,
-            mockturtle_rounds=args.mockturtle_rounds,
-            keep_existing=not args.ignore_existing,
-            verify_existing=args.verify_existing,
-            anf_term_cap=args.anf_term_cap,
-            abc_aig_top_k=args.abc_aig_top_k,
-            abc_aig_rounds=args.abc_aig_rounds,
-            max_workers=args.max_workers,
-            effort=args.effort,
-        )
+    print(
+        f"[INFO] cases={len(truth_files)} jobs={jobs} "
+        f"workers_per_case={per_case_workers} effort={args.effort}"
+    )
 
-        if old_stats is not None and candidate.stats.adp < old_stats.adp:
-            improved += 1
-        total_adp += candidate.stats.adp
+    results: list[CaseRunResult] = []
+
+    def print_result(result: CaseRunResult) -> None:
         print(
-            f"[BEST] {truth.stem}: {candidate.name:<18} "
-            f"inputs={problem.inputs:<2} "
-            f"area={candidate.stats.area:<7} delay={candidate.stats.delay:<3} "
-            f"adp={candidate.stats.adp}"
+            f"[BEST] {result.case}: {result.candidate_name:<18} "
+            f"inputs={result.inputs:<2} "
+            f"area={result.stats.area:<7} delay={result.stats.delay:<3} "
+            f"adp={result.stats.adp}"
         )
 
+    if jobs == 1:
+        for truth in truth_files:
+            try:
+                result = run_one_case(truth, config)
+            except Exception as exc:
+                print(f"[ERROR] {truth.stem}: {exc}", file=sys.stderr)
+                return 1
+            results.append(result)
+            print_result(result)
+    else:
+        failures = 0
+        with ProcessPoolExecutor(max_workers=jobs) as pool:
+            futures = {pool.submit(run_one_case, truth, config): truth for truth in truth_files}
+            for future in as_completed(futures):
+                truth = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    failures += 1
+                    print(f"[ERROR] {truth.stem}: {exc}", file=sys.stderr)
+                    continue
+                results.append(result)
+                print_result(result)
+        if failures:
+            print(f"Failed cases: {failures}", file=sys.stderr)
+            return 1
+
+    total_adp = sum(result.stats.adp for result in results)
+    improved = sum(1 for result in results if result.improved)
     print(f"Generated {len(truth_files)} AIG file(s) in {args.output}")
     print(f"Improved cases this run: {improved}")
     print(f"Total local ADP estimate: {total_adp}")
+    if reference_stats is not None:
+        print_reference_gap_report(reference_gap_rows(truth_files, args.output, reference_stats), args.reference_top)
     return 0
 
 

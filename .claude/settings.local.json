@@ -16,7 +16,17 @@
       "PowerShell(wsl bash -c \"apt-cache show python3-pip 2>/dev/null | head -3; which pipx 2>/dev/null; ls /usr/lib/python3/ 2>/dev/null | head\")",
       "PowerShell(wsl bash -c \"sudo apt-get install -y python3-pip 2>&1 | tail -5\")",
       "Bash(gh api *)",
-      "PowerShell(wsl python3 /mnt/c/Users/�ޫ���/Desktop/ALS_Final_Project/test_new_synth.py)"
+      "PowerShell(wsl python3 /mnt/c/Users/�ޫ���/Desktop/ALS_Final_Project/test_new_synth.py)",
+      "Bash(python analyze_adp.py)",
+      "PowerShell(Set-Location \"c:\\\\Users\\\\管奕凱\\\\Desktop\\\\ALS_Final_Project\"; python3 analyze_adp.py 2>&1; echo \"Exit: $LASTEXITCODE\")",
+      "Bash(which python *)",
+      "Read(//mnt/c/Users/管奕凱/Desktop/**)",
+      "PowerShell([System.IO.Directory]::GetDirectories\\(\"C:\\\\Users\"\\) | ForEach-Object { Write-Host $_ })",
+      "PowerShell([System.IO.Directory]::GetDirectories\\(\"C:\\\\Users\\\\管奕凱\\\\AppData\\\\Local\"\\) | ForEach-Object { Write-Host $_ })",
+      "PowerShell([System.IO.Directory]::GetDirectories\\(\"C:\\\\Users\\\\管奕凱\\\\AppData\\\\Local\\\\Programs\"\\) | ForEach-Object { Write-Host $_ })",
+      "PowerShell($env:PATH -split \";\" | ForEach-Object { Write-Host $_ })",
+      "PowerShell(wsl --list --running 2>&1)",
+      "PowerShell(wsl python3 --version 2>&1)"
     ],
     "additionalDirectories": [
       "c:\\Users\\管奕凱\\.claude\\projects\\c--Users-----Desktop-ALS-Final-Project\\memory"
